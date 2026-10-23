@@ -1,0 +1,1340 @@
+/**
+ * Lalakum Salma — the persona that lives in one or more Discord channels.
+ *
+ * `GeminiLivePersona` owns the Live session; this module owns everything
+ * Discord: batching, channel history, tool execution, rate limiting and
+ * sending the reply. It is intentionally fail-silent: every error path just
+ * means Salma says nothing.
+ */
+import type { Channel, Client, Guild, Message, MessageMentionOptions } from 'discord.js';
+import { Type, type FunctionDeclaration } from '@google/genai';
+import { getConfig, type PersonaConfig } from '../config';
+import { buildSalmaRuntimePrompt, SALMA_DEFAULT_PROMPT } from '../prompts/salma';
+import {
+  GeminiLivePersona,
+  type PersonaDecision,
+  type PersonaMedia,
+  type PersonaToolCall,
+  type PersonaToolExecutor,
+} from './gemini-persona';
+import { addMemory, countMemories, recallMemories } from './salma-memory';
+import { collectMessageMedia } from './salma-media';
+
+/* ------------------------------------------------------------------ */
+/* State                                                               */
+/* ------------------------------------------------------------------ */
+
+interface HistoryEntry {
+  id: string;
+  authorId: string;
+  authorName: string;
+  content: string;
+  timestamp: number;
+  bot: boolean;
+  /** Compact `[reply to ...]` marker when this message is a native reply. */
+  replyTo?: string;
+}
+
+interface PendingBatch {
+  messages: Message[];
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const MAX_HISTORY_ENTRIES = 200;
+const MAX_MESSAGE_CHARS = 500;
+const MAX_BATCH_MESSAGES = 12;
+const MAX_REPLY_LENGTH = 2_000;
+const MAX_TOOL_LIMIT = 25;
+const MAX_REPLY_AGE_MS = 60_000;
+
+const history = new Map<string, HistoryEntry[]>();
+const historyIds = new Map<string, Set<string>>();
+const primingChannels = new Set<string>();
+const batches = new Map<string, PendingBatch>();
+const replyTimestamps: number[] = [];
+
+let persona: GeminiLivePersona | null = null;
+let personaKey = '';
+let lastReplyAt = 0;
+let lastDecisionAt = 0;
+
+/* ------------------------------------------------------------------ */
+/* Public entry points                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Feed one Discord message to Salma.
+ *
+ * Safe to call for every message: it returns immediately and does its work in
+ * the background. The caller (messageCreate) must not await the persona.
+ */
+export function handleSalmaMessage(message: Message): void {
+  if (!message.guild || message.system) return;
+
+  const cfg = getConfig().persona;
+  if (!cfg.enabled) return;
+  if (!cfg.channelIds.includes(message.channelId)) return;
+
+  // Bots are context, never triggers (this also stops the persona reacting to
+  // its own replies).
+  if (message.author.bot) {
+    if (!history.has(message.channelId)) schedulePrimeHistory(message.channel, cfg);
+    addHistory(message);
+    return;
+  }
+
+  if (!message.content.trim() && message.attachments.size === 0) return;
+
+  logMemberMessage(message);
+
+  // Enabling Salma while the bot is already running skips the startup prime, so
+  // the first message a channel sees pulls recent context in the background.
+  // The batch window usually gives it time to land.
+  if (!history.has(message.channelId)) schedulePrimeHistory(message.channel, cfg);
+
+  addHistory(message);
+
+  const existing = batches.get(message.channelId);
+  if (existing) {
+    existing.messages.push(message);
+    // The window is anchored to the first message so a busy channel still gets
+    // a reply promptly instead of postponing it forever.
+    if (existing.messages.length >= MAX_BATCH_MESSAGES) {
+      clearTimeout(existing.timer);
+      batches.delete(message.channelId);
+      void flushBatch(message.channelId, existing.messages);
+    }
+    return;
+  }
+
+  const batch: PendingBatch = {
+    messages: [message],
+    timer: setTimeout(() => {
+      batches.delete(message.channelId);
+      void flushBatch(message.channelId, batch.messages);
+    }, Math.max(cfg.batchWindowMs, 250)),
+  };
+  batches.set(message.channelId, batch);
+}
+
+/** Close the Live session and drop pending batches (shutdown only). */
+export function closeSalma(): void {
+  persona?.close();
+  persona = null;
+  personaKey = '';
+
+  for (const batch of batches.values()) clearTimeout(batch.timer);
+  batches.clear();
+  history.clear();
+  historyIds.clear();
+  primingChannels.clear();
+  replyTimestamps.length = 0;
+  lastReplyAt = 0;
+  lastDecisionAt = 0;
+}
+
+/** Whether a Live session is currently being reused. */
+export function isSalmaActive(): boolean {
+  return persona !== null;
+}
+
+/**
+ * Pre-load recent messages for every configured channel so Salma has context
+ * after a restart even before a new message arrives.
+ */
+export async function primeSalmaHistory(client: Client): Promise<void> {
+  const cfg = getConfig().persona;
+  if (!cfg.enabled || cfg.channelIds.length === 0) return;
+
+  for (const channelId of cfg.channelIds) {
+    const channel = client.channels.cache.get(channelId);
+    if (!channel?.isTextBased()) continue;
+
+    const entries = await fetchHistory(channel, cfg);
+    for (const entry of entries) addHistoryEntry(channelId, entry);
+  }
+}
+
+export interface SalmaTestResult {
+  action: 'reply' | 'silent';
+  message: string;
+  stickerId?: string;
+  replyToTrigger?: boolean;
+  toolCalls: string[];
+  model: string;
+}
+
+/**
+ * Dashboard test: run one synthetic message through the persona without
+ * touching the live history or sending anything to Discord.
+ */
+export async function testSalmaPersona(client: Client, text: string): Promise<SalmaTestResult> {
+  const cfg = getConfig().persona;
+  const apiKey = resolveApiKey();
+  if (!apiKey) {
+    throw new Error('No Gemini API key configured (GEMINI_API_KEY or the dashboard secret).');
+  }
+
+  const guild = client.guilds.cache.get(getConfig().guildId) ?? client.guilds.cache.first();
+  if (!guild) throw new Error('The bot is not connected to any server yet.');
+
+  const channel = findTestChannel(guild, cfg);
+  if (!channel) {
+    throw new Error('Configure at least one Salma channel (or any text channel the bot can read).');
+  }
+
+  // Snapshot of the channel exactly like a live flush would see it, plus the
+  // synthetic message from the dashboard.
+  const localHistory = await fetchHistory(channel, cfg);
+
+  const snapshot = buildEventPayload({
+    guild,
+    channel,
+    previous: localHistory,
+    batch: [],
+    synthetic: {
+      authorName: 'dashboard test',
+      content: text.trim(),
+      timestamp: Date.now(),
+    },
+  });
+
+  const testPersona = buildPersona(
+    cfg,
+    apiKey,
+    buildToolDeclarations(cfg),
+    client.user?.id ?? '',
+  );
+  const executor = createToolExecutor({
+    guild,
+    channel,
+    trigger: null,
+    history: () => localHistory,
+  });
+
+  try {
+    const decision = await testPersona.ask(snapshot, executor, cfg.requestTimeoutMs);
+    return {
+      action: decision?.action ?? 'silent',
+      message: decision?.message ?? '',
+      stickerId: decision?.stickerId,
+      replyToTrigger: decision?.replyToTrigger,
+      toolCalls: decision?.toolCalls ?? [],
+      model: cfg.model,
+    };
+  } finally {
+    testPersona.close();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Batch evaluation                                                    */
+/* ------------------------------------------------------------------ */
+
+async function flushBatch(channelId: string, messages: Message[]): Promise<void> {
+  const cfg = getConfig().persona;
+  if (!cfg.enabled || !cfg.channelIds.includes(channelId)) return;
+
+  const trigger = messages[messages.length - 1];
+  if (!trigger || !trigger.guild) return;
+
+  if (isRateLimited(cfg)) {
+    console.debug('[Salma] Rate limited — staying silent', {
+      channelId,
+      cooldownSeconds: cfg.replyCooldownSeconds,
+      maxRepliesPerHour: cfg.maxRepliesPerHour,
+    });
+    return;
+  }
+
+  // A busy channel would otherwise open a Live session every few seconds even
+  // when Salma keeps deciding to stay quiet. Skipping an evaluation is safe:
+  // the messages stay in history and the next decision sees them.
+  if (
+    cfg.decisionCooldownSeconds > 0 &&
+    Date.now() - lastDecisionAt < cfg.decisionCooldownSeconds * 1_000
+  ) {
+    console.debug('[Salma] Decision cooldown — staying silent', {
+      channelId,
+      cooldownSeconds: cfg.decisionCooldownSeconds,
+    });
+    return;
+  }
+
+  const apiKey = resolveApiKey();
+  if (!apiKey) {
+    console.warn('[Salma] Enabled but no Gemini API key is configured.');
+    return;
+  }
+
+  const entries = history.get(channelId) ?? [];
+  const batchIds = new Set(messages.map((message) => message.id));
+  const previous = entries.filter((entry) => !batchIds.has(entry.id));
+
+  const payload = buildEventPayload({
+    guild: trigger.guild,
+    channel: trigger.channel,
+    previous,
+    batch: messages,
+  });
+
+  // Images/GIFs are fetched while the typing indicator is shown, so the model
+  // receives the visual context with the same event as the text snapshot.
+  const mediaPromise = collectMessageMedia(messages).catch(() => [] as PersonaMedia[]);
+
+  const channel = trigger.channel;
+  const typingChannel = channel as Channel & { sendTyping?: () => Promise<void> };
+  if (cfg.showTyping && typeof typingChannel.sendTyping === 'function') {
+    try {
+      await typingChannel.sendTyping();
+    } catch {
+      /* typing is cosmetic */
+    }
+  }
+
+  const media = await mediaPromise;
+
+  let decision: PersonaDecision | null;
+  try {
+    const client = createPersona(
+      cfg,
+      apiKey,
+      buildToolDeclarations(cfg),
+      trigger.client.user?.id ?? '',
+    );
+    const executor = createToolExecutor({
+      guild: trigger.guild,
+      channel,
+      trigger,
+      history: () => history.get(channelId) ?? [],
+    });
+    decision = await client.ask(payload, executor, cfg.requestTimeoutMs, media);
+  } catch (err) {
+    console.error('[Salma] Failed to evaluate batch:', err);
+    return;
+  } finally {
+    lastDecisionAt = Date.now();
+  }
+
+  console.debug('[Salma] Decision', {
+    channelId,
+    action: decision?.action ?? 'none (fail silent)',
+    toolCalls: decision?.toolCalls ?? [],
+    messageLength: decision?.message.length ?? 0,
+    stickerId: decision?.stickerId ?? null,
+    reply: decision?.replyToTrigger ?? false,
+    media: media.length,
+  });
+
+  if (!decision || decision.action !== 'reply' || (!decision.message.trim() && !decision.stickerId)) {
+    return;
+  }
+
+  // Another batch may have replied while this one was thinking.
+  if (isRateLimited(cfg)) {
+    console.debug('[Salma] Reply dropped — rate limited after generation', { channelId });
+    return;
+  }
+
+  // A queue backlog can make an answer arrive too late to make sense.
+  if (Date.now() - trigger.createdTimestamp > MAX_REPLY_AGE_MS) {
+    console.debug('[Salma] Reply dropped — trigger is stale', {
+      channelId,
+      ageMs: Date.now() - trigger.createdTimestamp,
+    });
+    return;
+  }
+
+  await sendDecision(trigger, decision, cfg);
+}
+
+async function sendDecision(trigger: Message, decision: PersonaDecision, cfg: PersonaConfig): Promise<void> {
+  const channel = trigger.channel;
+  if (!trigger.guild || !channel.isTextBased() || channel.isDMBased()) return;
+
+  const limit = Math.min(Math.max(cfg.maxMessageLength, 1), MAX_REPLY_LENGTH);
+  const sanitized = sanitizeOutgoing(decision.message).slice(0, limit).trim();
+  const content = sanitized ? await validateMentions(sanitized, trigger.guild) : '';
+
+  const requestedSticker = decision.stickerId?.trim() ?? '';
+  const sticker =
+    requestedSticker && /^\d{15,25}$/.test(requestedSticker)
+      ? trigger.guild.stickers.cache.get(requestedSticker)
+      : null;
+
+  if (requestedSticker && !sticker) {
+    console.warn('[Salma] Ignoring unknown sticker id', { stickerId: requestedSticker });
+  }
+
+  if (!content && !sticker) return;
+
+  // Users may be pinged through <@ID> markup, but roles, @everyone and @here
+  // stay silent. A native reply notifies the trigger author when chosen.
+  const allowedMentions: MessageMentionOptions = {
+    parse: ['users'],
+    repliedUser: Boolean(decision.replyToTrigger),
+  };
+
+  const payload = {
+    content: content || undefined,
+    allowedMentions,
+    ...(sticker ? { stickers: [sticker.id] } : {}),
+  };
+
+  let sent: Message;
+  try {
+    sent = decision.replyToTrigger
+      ? await trigger.reply({ ...payload, failIfNotExists: false })
+      : await channel.send(payload);
+  } catch (err) {
+    console.error('[Salma] Failed to send reply:', err);
+    return;
+  }
+
+  const now = Date.now();
+  lastReplyAt = now;
+  replyTimestamps.push(now);
+  pruneReplyTimestamps(now);
+
+  const historyContent = [
+    content,
+    sticker ? `[sticker: ${sticker.name} (id: ${sticker.id})]` : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
+  // Register the sent message immediately so the next batch sees it even
+  // before the gateway echo arrives; the echo then dedupes on the message id.
+  addHistoryEntry(trigger.channelId, {
+    id: sent.id,
+    authorId: sent.author.id,
+    authorName: cfg.displayName,
+    content: historyContent || '[sticker]',
+    timestamp: sent.createdTimestamp,
+    bot: true,
+    replyTo: decision.replyToTrigger
+      ? `[reply to ${sanitizeTag(trigger.member?.displayName ?? trigger.author.username)} (${trigger.author.id})]`
+      : undefined,
+  });
+
+  console.debug('[Salma] Reply sent', {
+    channelId: trigger.channelId,
+    length: content.length,
+    stickerId: sticker?.id ?? null,
+    reply: Boolean(decision.replyToTrigger),
+  });
+}
+
+function isRateLimited(cfg: PersonaConfig): boolean {
+  const now = Date.now();
+  if (cfg.replyCooldownSeconds > 0 && now - lastReplyAt < cfg.replyCooldownSeconds * 1_000) {
+    return true;
+  }
+
+  pruneReplyTimestamps(now);
+  return cfg.maxRepliesPerHour > 0 && replyTimestamps.length >= cfg.maxRepliesPerHour;
+}
+
+function pruneReplyTimestamps(now: number): void {
+  const cutoff = now - 60 * 60 * 1_000;
+  while (replyTimestamps.length > 0 && replyTimestamps[0] < cutoff) replyTimestamps.shift();
+}
+
+/* ------------------------------------------------------------------ */
+/* History                                                             */
+/* ------------------------------------------------------------------ */
+
+function addHistory(message: Message): void {
+  const content = describeMessage(message);
+  if (!content) return;
+
+  addHistoryEntry(message.channelId, {
+    id: message.id,
+    authorId: message.author.id,
+    authorName: message.member?.displayName ?? message.author.username,
+    content,
+    timestamp: message.createdTimestamp,
+    bot: message.author.bot,
+    replyTo: describeReply(message),
+  });
+}
+
+function addHistoryEntry(channelId: string, entry: HistoryEntry): void {
+  let ids = historyIds.get(channelId);
+  if (!ids) {
+    ids = new Set();
+    historyIds.set(channelId, ids);
+  }
+  if (ids.has(entry.id)) return;
+  ids.add(entry.id);
+
+  const entries = history.get(channelId) ?? [];
+  entries.push(entry);
+  if (entries.length > MAX_HISTORY_ENTRIES) {
+    const removed = entries.splice(0, entries.length - MAX_HISTORY_ENTRIES);
+    for (const old of removed) ids.delete(old.id);
+  }
+  history.set(channelId, entries);
+}
+
+/** Pull recent channel context in the background, at most once per channel. */
+function schedulePrimeHistory(channel: Channel, cfg: PersonaConfig): void {
+  if (primingChannels.has(channel.id)) return;
+  primingChannels.add(channel.id);
+
+  void fetchHistory(channel, cfg)
+    .then((entries) => {
+      for (const entry of entries) addHistoryEntry(channel.id, entry);
+    })
+    .catch(() => {
+      /* Context is a nice-to-have; the live batch still works without it. */
+    })
+    .finally(() => primingChannels.delete(channel.id));
+}
+
+function describeMessage(message: Message): string {
+  const content = cleanMessageContent(message).replace(/\s+/g, ' ').trim();
+
+  const attachments = [...message.attachments.values()].slice(0, 3).map((attachment) => {
+    const type = (attachment.contentType ?? '').toLowerCase();
+    const name = attachment.name ?? 'attachment';
+    const kind =
+      type === 'image/gif' || name.toLowerCase().endsWith('.gif')
+        ? 'gif'
+        : type.startsWith('image/')
+          ? 'image'
+          : type.startsWith('video/')
+            ? 'video'
+            : type.startsWith('audio/')
+              ? 'audio'
+              : 'file';
+    return `[${kind}: ${name}]`;
+  });
+
+  if (message.attachments.size > 3) {
+    const extra = message.attachments.size - 3;
+    attachments.push(`[+${extra} more attachment${extra === 1 ? '' : 's'}]`);
+  }
+
+  const stickers = [...message.stickers.values()].map(
+    (sticker) => `[sticker: ${sticker.name} (id: ${sticker.id})]`,
+  );
+
+  const extras = [...attachments, ...stickers].join(' ');
+  if (!content && !extras) return '';
+
+  const trimmed = content.length > MAX_MESSAGE_CHARS ? `${content.slice(0, MAX_MESSAGE_CHARS)}…` : content;
+  return `${trimmed}${trimmed && extras ? ' ' : ''}${extras}`.trim();
+}
+
+/**
+ * Compact reply-reference context. A reply to one of the persona's own
+ * messages is labelled `your message`, which the runtime prompt treats as a
+ * strong signal that the new message is addressed to Salma.
+ */
+function describeReply(
+  message: Message,
+  known?: { get(id: string): Message | undefined },
+): string {
+  const referenceId = message.reference?.messageId;
+  if (!referenceId) return '';
+
+  const knownMessage =
+    known?.get(referenceId) ??
+    (message.channel.isTextBased()
+      ? message.channel.messages.cache.get(referenceId) ?? null
+      : null);
+  const historical = history
+    .get(message.channelId)
+    ?.find((entry) => entry.id === referenceId);
+
+  const authorId =
+    knownMessage?.author.id ?? message.mentions.repliedUser?.id ?? historical?.authorId ?? '';
+  const authorName =
+    knownMessage?.author.username ??
+    message.mentions.repliedUser?.username ??
+    historical?.authorName ??
+    '';
+  const member = authorId ? message.guild?.members.cache.get(authorId) : null;
+  const displayName = member?.displayName ?? authorName;
+  const isBotAuthor = Boolean(authorId && authorId === message.client.user?.id);
+
+  const label = isBotAuthor
+    ? 'your message'
+    : authorId
+      ? `${sanitizeTag(displayName || 'someone')} (${authorId})`
+      : 'an earlier message';
+
+  const excerpt = (knownMessage ? describeMessage(knownMessage) : historical?.content ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+
+  return `[reply to ${label}${excerpt ? `: "${excerpt}"` : ''}]`;
+}
+
+/**
+ * Discord's `cleanContent` rewrites custom emoji markup (`<:name:id>`) into
+ * `:name:`, which loses the id the model needs to reuse it. This keeps the
+ * markdown intact while still making mentions readable.
+ */
+function cleanMessageContent(message: Message): string {
+  const raw = message.content ?? '';
+  if (!raw) return '';
+
+  return raw
+    .replace(/<@!?(\d+)>/g, (match, id: string) => {
+      const member = message.guild?.members.cache.get(id);
+      if (member) return `@${member.displayName} (<@${id}>)`;
+      const user = message.client.users.cache.get(id);
+      return user ? `@${user.displayName} (<@${id}>)` : match;
+    })
+    .replace(/<@&(\d+)>/g, (match, id: string) => {
+      const role = message.guild?.roles.cache.get(id);
+      return role ? `@${role.name}` : match;
+    })
+    .replace(/<#(\d+)>/g, (match, id: string) => {
+      const channel = message.client.channels.cache.get(id) as { name?: string } | undefined;
+      return channel?.name ? `#${channel.name} (<#${id}>)` : match;
+    });
+}
+
+/** Console trace of every member message the persona is listening to. */
+function logMemberMessage(message: Message): void {
+  const author = message.member?.displayName ?? message.author.username;
+  const named = message.channel as Channel & { name?: string };
+  const where = named.name ? `#${named.name}` : message.channelId;
+  console.log(`[Salma] ${where} | ${author} (${message.author.id}): ${describeMessage(message)}`);
+}
+
+/* ------------------------------------------------------------------ */
+/* Prompt payload                                                      */
+/* ------------------------------------------------------------------ */
+
+interface PayloadInput {
+  guild: Guild;
+  channel: Channel;
+  previous: HistoryEntry[];
+  batch: Message[];
+  synthetic?: { authorName: string; content: string; timestamp: number };
+}
+
+function buildEventPayload(input: PayloadInput): string {
+  const { guild, channel, previous, batch, synthetic } = input;
+  const cfg = getConfig().persona;
+
+  const recent = previous
+    .slice(-Math.max(cfg.historySize, 1))
+    .map((entry) =>
+      formatEntry(
+        entry.authorName,
+        entry.authorId,
+        entry.content,
+        entry.timestamp,
+        entry.bot,
+        entry.replyTo,
+      ),
+    );
+
+  const incoming = batch.map((message) =>
+    formatEntry(
+      message.member?.displayName ?? message.author.username,
+      message.author.id,
+      describeMessage(message),
+      message.createdTimestamp,
+      message.author.bot,
+      describeReply(message),
+    ),
+  );
+
+  if (synthetic) {
+    incoming.push(
+      formatEntry(synthetic.authorName, '', synthetic.content, synthetic.timestamp, false, ''),
+    );
+  }
+
+  const latest = incoming.length ? incoming[incoming.length - 1] : '(none)';
+  const named = channel as Channel & { name?: string };
+  const channelName = named.name ? `#${named.name}` : 'this channel';
+
+  return [
+    `<current_time>${new Date().toISOString()} (Morocco: ${moroccoTime()})</current_time>`,
+    `<server>${sanitizeTag(guild.name)} — ${guild.memberCount} members</server>`,
+    `<channel id="${channel.id}">${sanitizeTag(channelName)}</channel>`,
+    '<recent_messages>',
+    recent.length ? recent.join('\n') : '(no earlier messages)',
+    '</recent_messages>',
+    '<new_messages>',
+    incoming.length ? incoming.join('\n') : '(no new messages)',
+    '</new_messages>',
+    '<latest_message>',
+    latest,
+    '</latest_message>',
+    '',
+    'Decide what Salma does now. Speak when she is addressed or has something genuinely worth adding; ' +
+      'stay silent only when she would be interrupting or repeating herself.',
+  ].join('\n');
+}
+
+function formatEntry(
+  author: string,
+  authorId: string,
+  content: string,
+  timestamp: number,
+  bot: boolean,
+  replyTo = '',
+): string {
+  const time = moroccoClock(timestamp);
+  const safeContent = content.replace(
+    /<\/?(?:recent_messages|new_messages|latest_message|current_time|server|channel)>/gi,
+    ' ',
+  );
+  const id = authorId ? ` (${authorId})` : '';
+  const reply = replyTo ? ` ${replyTo}` : '';
+  return `[${time}] ${bot ? '🤖 ' : ''}${author}${id}:${reply} ${safeContent || '(empty)'}`;
+}
+
+function sanitizeTag(value: string): string {
+  return value.replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+/** HH:MM in the persona's timezone, so message times match `get_current_time`. */
+function moroccoClock(timestamp: number): string {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZone: 'Africa/Casablanca',
+    }).format(new Date(timestamp));
+  } catch {
+    return new Date(timestamp).toISOString().slice(11, 16);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Persona lifecycle                                                   */
+/* ------------------------------------------------------------------ */
+
+function resolveApiKey(): string {
+  return process.env.GEMINI_API_KEY || getConfig().geminiApiKey || '';
+}
+
+function buildSystemPrompt(cfg: PersonaConfig, botId: string): string {
+  const runtime = buildSalmaRuntimePrompt({
+    displayName: cfg.displayName || 'Lalakum Salma',
+    botId,
+    toolsEnabled: cfg.toolsEnabled,
+    memoryEnabled: cfg.memoryEnabled,
+    maxMessageLength: Math.min(Math.max(cfg.maxMessageLength, 1), MAX_REPLY_LENGTH),
+  });
+
+  const character = cfg.systemPrompt.trim() || SALMA_DEFAULT_PROMPT;
+  return `${character}\n\n${runtime}`;
+}
+
+function createPersona(
+  cfg: PersonaConfig,
+  apiKey: string,
+  tools: FunctionDeclaration[],
+  botId: string,
+): GeminiLivePersona {
+  const key = [
+    apiKey,
+    cfg.model,
+    cfg.thinkingLevel,
+    cfg.systemPrompt,
+    cfg.displayName,
+    botId,
+    cfg.toolsEnabled,
+    cfg.memoryEnabled,
+    cfg.maxMessageLength,
+    cfg.temperature,
+    cfg.requestTimeoutMs,
+  ].join('|');
+
+  if (persona && personaKey === key) return persona;
+
+  persona?.close();
+  persona = buildPersona(cfg, apiKey, tools, botId);
+  personaKey = key;
+  return persona;
+}
+
+function buildPersona(
+  cfg: PersonaConfig,
+  apiKey: string,
+  tools: FunctionDeclaration[],
+  botId: string,
+): GeminiLivePersona {
+  return new GeminiLivePersona({
+    apiKey,
+    model: cfg.model,
+    systemPrompt: buildSystemPrompt(cfg, botId),
+    tools,
+    thinkingLevel: cfg.thinkingLevel,
+    temperature: cfg.temperature,
+    requestTimeoutMs: cfg.requestTimeoutMs,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Tool declarations                                                   */
+/* ------------------------------------------------------------------ */
+
+function buildToolDeclarations(cfg: PersonaConfig): FunctionDeclaration[] {
+  const tools: FunctionDeclaration[] = [];
+
+  if (cfg.toolsEnabled) {
+    tools.push(
+      {
+        name: 'get_recent_messages',
+        description: 'Read more of the current channel history than the snapshot you were given.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            limit: { type: Type.INTEGER, description: `How many messages (1-${MAX_TOOL_LIMIT}).` },
+          },
+        },
+      },
+      {
+        name: 'search_history',
+        description: 'Search the recent channel history for a word, topic or member name.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: { type: Type.STRING, description: 'Text or member name to look for.' },
+            limit: { type: Type.INTEGER, description: `How many matches (1-${MAX_TOOL_LIMIT}).` },
+          },
+          required: ['query'],
+        },
+      },
+      {
+        name: 'get_member_info',
+        description: 'Roles, join date, account age and nickname for one server member.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            member: { type: Type.STRING, description: 'Member id, @mention, username or display name.' },
+          },
+          required: ['member'],
+        },
+      },
+      {
+        name: 'get_server_info',
+        description: 'Server name, member count, creation date and description.',
+        parameters: { type: Type.OBJECT, properties: {} },
+      },
+      {
+        name: 'get_voice_members',
+        description: 'Members currently connected to voice channels.',
+        parameters: { type: Type.OBJECT, properties: {} },
+      },
+      {
+        name: 'get_channel_info',
+        description: 'Current channel name, topic, type and category.',
+        parameters: { type: Type.OBJECT, properties: {} },
+      },
+      {
+        name: 'get_current_time',
+        description: 'The real current date and time in Morocco and UTC.',
+        parameters: { type: Type.OBJECT, properties: {} },
+      },
+      {
+        name: 'react_to_message',
+        description:
+          'React to the latest message with one emoji. This is not a spoken message; ' +
+          'you may react and then stay silent.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            emoji: { type: Type.STRING, description: 'One Unicode emoji or a custom emoji like <:name:id>.' },
+          },
+          required: ['emoji'],
+        },
+      },
+    );
+  }
+
+  // Formatting helpers stay available even when the broader information tools
+  // are off: the model needs real emoji markdown and sticker ids to use them.
+  tools.push(
+    {
+      name: 'get_server_emojis',
+      description:
+        'List every custom emoji in this server with its exact Discord markdown ' +
+        '(`<:name:id>` or `<a:name:id>`). Use it before using a custom emoji you have not seen.',
+      parameters: { type: Type.OBJECT, properties: {} },
+    },
+    {
+      name: 'get_server_stickers',
+      description:
+        'List the stickers available in this server with their real sticker ids. ' +
+        'Use it before calling send_sticker.',
+      parameters: { type: Type.OBJECT, properties: {} },
+    },
+  );
+
+  if (cfg.memoryEnabled) {
+    tools.push(
+      {
+        name: 'recall_facts',
+        description: 'Read durable notes you saved earlier about this server or one member.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            about: { type: Type.STRING, description: 'Optional member id, @mention, username or name.' },
+            limit: { type: Type.INTEGER, description: 'How many notes (1-50).' },
+          },
+        },
+      },
+      {
+        name: 'remember_fact',
+        description:
+          'Save one durable fact about a member or the server so you can recall it in later conversations. ' +
+          'Only save information the member shared publicly; never secrets or sensitive personal data.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            fact: { type: Type.STRING, description: 'One short, factual note.' },
+            about: { type: Type.STRING, description: 'Optional member id, @mention, username or name.' },
+          },
+          required: ['fact'],
+        },
+      },
+    );
+  }
+
+  return tools;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tool execution                                                      */
+/* ------------------------------------------------------------------ */
+
+interface ToolContext {
+  guild: Guild;
+  channel: Channel;
+  trigger: Message | null;
+  history: () => HistoryEntry[];
+}
+
+function createToolExecutor(context: ToolContext): PersonaToolExecutor {
+  return async (call: PersonaToolCall): Promise<Record<string, unknown>> => {
+    const name = call.name ?? '';
+    const args = call.args ?? {};
+
+    switch (name) {
+      case 'get_recent_messages':
+        return getRecentMessages(context, args.limit);
+      case 'search_history':
+        return searchHistory(context, args.query, args.limit);
+      case 'get_member_info':
+        return await getMemberInfo(context, args.member);
+      case 'get_server_info':
+        return getServerInfo(context);
+      case 'get_voice_members':
+        return getVoiceMembers(context);
+      case 'get_channel_info':
+        return getChannelInfo(context);
+      case 'get_server_emojis':
+        return getServerEmojis(context);
+      case 'get_server_stickers':
+        return getServerStickers(context);
+      case 'get_current_time':
+        return getCurrentTime();
+      case 'react_to_message':
+        return await reactToMessage(context, args.emoji);
+      case 'recall_facts':
+        return await recallFacts(context, args.about, args.limit);
+      case 'remember_fact':
+        return await rememberFact(context, args.fact, args.about);
+      default:
+        return { ok: false, error: `Unknown tool: ${name}` };
+    }
+  };
+}
+
+function toLimit(value: unknown, fallback: number, max: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(Math.floor(parsed), 1), max);
+}
+
+function getRecentMessages(context: ToolContext, rawLimit: unknown): Record<string, unknown> {
+  const limit = toLimit(rawLimit, 20, MAX_TOOL_LIMIT);
+  const entries = context.history()
+    .slice(-limit)
+    .map((entry) => ({
+      time: moroccoClock(entry.timestamp),
+      author: entry.authorName,
+      authorId: entry.authorId,
+      content: entry.content,
+      bot: entry.bot,
+    }));
+  return { ok: true, messages: entries };
+}
+
+function searchHistory(context: ToolContext, rawQuery: unknown, rawLimit: unknown): Record<string, unknown> {
+  const query = typeof rawQuery === 'string' ? rawQuery.trim().toLowerCase() : '';
+  if (!query) return { ok: false, error: 'A search term is required.' };
+
+  const limit = toLimit(rawLimit, 10, MAX_TOOL_LIMIT);
+  const matches = context
+    .history()
+    .filter(
+      (entry) =>
+        entry.content.toLowerCase().includes(query) ||
+        entry.authorName.toLowerCase().includes(query),
+    )
+    .slice(-limit)
+    .reverse()
+    .map((entry) => ({
+      time: moroccoClock(entry.timestamp),
+      author: entry.authorName,
+      authorId: entry.authorId,
+      content: entry.content,
+      bot: entry.bot,
+    }));
+
+  return { ok: true, query, matches };
+}
+
+async function resolveMember(
+  context: ToolContext,
+  raw: unknown,
+): Promise<{ id: string; displayName: string; username: string } | null> {
+  if (typeof raw !== 'string') return null;
+  const query = raw.replace(/^<@!?(\d+)>$/, '$1').trim();
+  if (!query) return null;
+
+  const cached = context.guild.members.cache.find(
+    (member) =>
+      member.id === query ||
+      member.user.username.toLowerCase() === query.toLowerCase() ||
+      member.displayName.toLowerCase() === query.toLowerCase(),
+  );
+  if (cached) {
+    return {
+      id: cached.id,
+      displayName: cached.displayName,
+      username: cached.user.username,
+    };
+  }
+
+  if (/^\d{15,25}$/.test(query)) {
+    const fetched = await context.guild.members.fetch(query).catch(() => null);
+    if (fetched) {
+      return {
+        id: fetched.id,
+        displayName: fetched.displayName,
+        username: fetched.user.username,
+      };
+    }
+  }
+
+  try {
+    const results = await context.guild.members.fetch({ query, limit: 1 });
+    const member = results.first();
+    if (member) {
+      return {
+        id: member.id,
+        displayName: member.displayName,
+        username: member.user.username,
+      };
+    }
+  } catch {
+    /* member search is best-effort */
+  }
+
+  return null;
+}
+
+async function getMemberInfo(context: ToolContext, raw: unknown): Promise<Record<string, unknown>> {
+  const resolved = await resolveMember(context, raw);
+  if (!resolved) return { ok: false, error: 'Member not found.' };
+
+  const member = context.guild.members.cache.get(resolved.id);
+  if (!member) return { ok: false, error: 'Member not found.' };
+
+  const roles = [...member.roles.cache.values()]
+    .filter((role) => role.id !== context.guild.id)
+    .sort((a, b) => b.position - a.position)
+    .slice(0, 12)
+    .map((role) => role.name);
+
+  return {
+    ok: true,
+    id: member.id,
+    displayName: member.displayName,
+    username: member.user.username,
+    bot: member.user.bot,
+    joinedAt: member.joinedAt?.toISOString() ?? null,
+    accountCreatedAt: member.user.createdAt.toISOString(),
+    roles,
+    highestRole: member.roles.highest.name,
+    timedOutUntil: member.communicationDisabledUntil?.toISOString() ?? null,
+  };
+}
+
+function getServerInfo(context: ToolContext): Record<string, unknown> {
+  return {
+    ok: true,
+    name: context.guild.name,
+    id: context.guild.id,
+    memberCount: context.guild.memberCount,
+    createdAt: context.guild.createdAt.toISOString(),
+    description: context.guild.description,
+    ownerId: context.guild.ownerId,
+    preferredLocale: context.guild.preferredLocale,
+  };
+}
+
+function getVoiceMembers(context: ToolContext): Record<string, unknown> {
+  const channels: Array<{
+    channel: string;
+    members: Array<{ name: string; id: string }>;
+    count: number;
+  }> = [];
+
+  for (const channel of context.guild.channels.cache.values()) {
+    if (!channel.isVoiceBased()) continue;
+    const humans = [...channel.members.values()].filter((member) => !member.user.bot);
+    if (humans.length === 0) continue;
+    channels.push({
+      channel: channel.name,
+      members: humans.slice(0, 10).map((member) => ({ name: member.displayName, id: member.id })),
+      count: humans.length,
+    });
+  }
+
+  return {
+    ok: true,
+    channels: channels.slice(0, 15),
+    totalConnected: channels.reduce((sum, entry) => sum + entry.count, 0),
+  };
+}
+
+function getChannelInfo(context: ToolContext): Record<string, unknown> {
+  const channel = context.channel as Channel & {
+    name?: string;
+    topic?: string | null;
+    type?: number;
+    parent?: { name?: string } | null;
+  };
+
+  return {
+    ok: true,
+    id: context.channel.id,
+    name: channel.name ?? null,
+    topic: channel.topic ?? null,
+    type: channel.type ?? null,
+    category: channel.parent?.name ?? null,
+  };
+}
+
+function getServerEmojis(context: ToolContext): Record<string, unknown> {
+  const emojis = [...context.guild.emojis.cache.values()].map((emoji) => ({
+    name: emoji.name,
+    id: emoji.id,
+    animated: Boolean(emoji.animated),
+    emoji_md: `<${emoji.animated ? 'a' : ''}:${emoji.name}:${emoji.id}>`,
+  }));
+
+  return {
+    ok: true,
+    count: emojis.length,
+    emojis,
+    next: 'Use one of these emoji_md values exactly in send_message, or call stay_silent.',
+  };
+}
+
+function getServerStickers(context: ToolContext): Record<string, unknown> {
+  const stickers = [...context.guild.stickers.cache.values()].map((sticker) => ({
+    id: sticker.id,
+    name: sticker.name,
+    description: sticker.description,
+    tags: sticker.tags,
+    format: sticker.format,
+    available: sticker.available,
+  }));
+
+  return {
+    ok: true,
+    count: stickers.length,
+    stickers,
+    next: 'Call send_sticker with a fitting sticker id, or call stay_silent if none fits.',
+  };
+}
+
+function getCurrentTime(): Record<string, unknown> {
+  return {
+    ok: true,
+    utc: new Date().toISOString(),
+    morocco: moroccoTime(),
+    timezone: 'Africa/Casablanca',
+  };
+}
+
+function moroccoTime(): string {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      dateStyle: 'full',
+      timeStyle: 'short',
+      timeZone: 'Africa/Casablanca',
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+async function reactToMessage(context: ToolContext, rawEmoji: unknown): Promise<Record<string, unknown>> {
+  const trigger = context.trigger;
+  if (!trigger) return { ok: false, error: 'No message is available to react to.' };
+  if (typeof rawEmoji !== 'string') return { ok: false, error: 'An emoji is required.' };
+
+  const emoji = rawEmoji.trim();
+  if (!emoji || emoji.length > 64 || /[\r\n]/.test(emoji)) {
+    return { ok: false, error: 'Invalid emoji.' };
+  }
+
+  try {
+    await trigger.react(emoji);
+    return { ok: true, emoji };
+  } catch (err) {
+    return { ok: false, error: describeError(err) };
+  }
+}
+
+async function recallFacts(
+  context: ToolContext,
+  rawAbout: unknown,
+  rawLimit: unknown,
+): Promise<Record<string, unknown>> {
+  const limit = toLimit(rawLimit, 20, 50);
+  const about = typeof rawAbout === 'string' ? rawAbout.trim() : '';
+
+  let notes = about ? recallMemories(context.guild.id, { about, limit }) : recallMemories(context.guild.id, { limit });
+
+  if (about && notes.length === 0) {
+    const resolved = await resolveMember(context, about);
+    if (resolved) notes = recallMemories(context.guild.id, { about: resolved.id, limit });
+  }
+
+  return {
+    ok: true,
+    notes: notes.map((note) => ({
+      fact: note.fact,
+      about: note.aboutName ?? null,
+      createdAt: new Date(note.createdAt).toISOString(),
+    })),
+    totalNotes: countMemories(context.guild.id),
+  };
+}
+
+async function rememberFact(
+  context: ToolContext,
+  rawFact: unknown,
+  rawAbout: unknown,
+): Promise<Record<string, unknown>> {
+  if (typeof rawFact !== 'string' || !rawFact.trim()) {
+    return { ok: false, error: 'A fact is required.' };
+  }
+
+  const about = typeof rawAbout === 'string' ? rawAbout.trim() : '';
+  const resolved = about ? await resolveMember(context, about) : null;
+
+  const note = addMemory(context.guild.id, {
+    fact: rawFact,
+    aboutUserId: resolved?.id,
+    aboutName: resolved?.displayName ?? (about || undefined),
+  });
+
+  if (!note) return { ok: false, error: 'The fact was empty and was not saved.' };
+
+  return {
+    ok: true,
+    id: note.id,
+    fact: note.fact,
+    about: note.aboutName ?? null,
+    totalNotes: countMemories(context.guild.id),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+async function fetchHistory(channel: Channel, cfg: PersonaConfig): Promise<HistoryEntry[]> {
+  if (!channel.isTextBased()) return [];
+
+  try {
+    const fetched = await channel.messages.fetch({
+      limit: Math.min(Math.max(cfg.historySize, 1), 50),
+    });
+    return [...fetched.values()]
+      .reverse()
+      .filter((message) => !message.system)
+      .map((message) => ({
+        id: message.id,
+        authorId: message.author.id,
+        authorName: message.member?.displayName ?? message.author.username,
+        content: describeMessage(message),
+        timestamp: message.createdTimestamp,
+        bot: message.author.bot,
+        replyTo: describeReply(message, fetched),
+      }))
+      .filter((entry) => entry.content !== '');
+  } catch {
+    return [];
+  }
+}
+
+function findTestChannel(guild: Guild, cfg: PersonaConfig): Channel | null {
+  for (const channelId of cfg.channelIds) {
+    const channel = guild.channels.cache.get(channelId);
+    if (channel?.isTextBased()) return channel;
+  }
+
+  const fallback = guild.channels.cache.find((channel) => channel.isTextBased());
+  return fallback ?? null;
+}
+
+function sanitizeOutgoing(value: string): string {
+  return value
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/@everyone/g, '@\u200Beveryone')
+    .replace(/@here/g, '@\u200Bhere')
+    .trim();
+}
+
+/**
+ * A hallucinated `<@ID>` could ping a real member. Only mentions that resolve
+ * to an actual guild member are kept; anything else becomes plain text.
+ */
+async function validateMentions(content: string, guild: Guild): Promise<string> {
+  const ids = new Set([...content.matchAll(/<@!?(\d{15,25})>/g)].map((match) => match[1]));
+  if (ids.size === 0) return content;
+
+  let result = content;
+  for (const id of ids) {
+    if (guild.members.cache.has(id)) continue;
+
+    const member = await guild.members.fetch(id).catch(() => null);
+    if (!member) result = result.replace(new RegExp(`<@!?${id}>`, 'g'), `@${id}`);
+  }
+
+  return result;
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object') {
+    const record = err as { message?: string; reason?: string };
+    return record.message || record.reason || JSON.stringify(record);
+  }
+  return String(err);
+}

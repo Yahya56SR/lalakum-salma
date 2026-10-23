@@ -1,0 +1,6 @@
+# Normalise line endings: store LF in the repo, check out CRLF on Windows.
+* text=auto eol=lf
+
+# Binary assets
+*.png binary
+*.woff2 binary

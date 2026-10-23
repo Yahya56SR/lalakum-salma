@@ -1,0 +1,24 @@
+{
+  "token": "YOUR_BOT_TOKEN_HERE",
+  "geminiApiKey": "YOUR_GEMINI_API_KEY_HERE",
+  "guildId": "YOUR_GUILD_ID_HERE",
+  "persona": {
+    "enabled": false,
+    "displayName": "Lalakum Salma",
+    "model": "gemini-3.8-live",
+    "thinkingLevel": "low",
+    "systemPrompt": "",
+    "channelIds": [],
+    "historySize": 30,
+    "batchWindowMs": 2500,
+    "replyCooldownSeconds": 25,
+    "decisionCooldownSeconds": 10,
+    "maxRepliesPerHour": 40,
+    "maxMessageLength": 500,
+    "showTyping": false,
+    "toolsEnabled": true,
+    "memoryEnabled": true,
+    "temperature": 1,
+    "requestTimeoutMs": 20000
+  }
+}
